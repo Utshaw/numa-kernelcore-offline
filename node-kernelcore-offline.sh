@@ -3,6 +3,7 @@
 #
 # Example:
 #   sudo ./node-kernelcore-offline.sh --node 1 --online-gib 11 --reboot
+#   sudo ./node-kernelcore-offline.sh --node 1 --kernel /boot/vmlinuz-5.15.95-uts+ --kernelcore-gib 15 --reboot
 #
 # The requested online size is a per-memory-node ZONE_NORMAL target.  Linux
 # distributes kernelcore across memory nodes, and a memory-hotplug block cannot
@@ -76,7 +77,9 @@ resume() {
 
   [[ ${NODE:-} =~ ^[0-9]+$ ]] || die 'invalid pending node number'
   [[ ${KERNELCORE:-} =~ ^[0-9]+G$ ]] || die 'invalid pending kernelcore value'
+  [[ ${TARGET_RELEASE:-} =~ ^[[:alnum:].+_-]+$ ]] || die 'invalid pending target kernel release'
   [[ -d "/sys/devices/system/node/node$NODE" ]] || die "NUMA node $NODE is absent"
+  [[ $(uname -r) == "$TARGET_RELEASE" ]] || die "this boot is $(uname -r), but pending operation targets $TARGET_RELEASE"
   [[ " $(< /proc/cmdline) " == *" kernelcore=$KERNELCORE "* ]] ||
     die "this boot does not have the expected kernelcore=$KERNELCORE parameter"
 
@@ -109,12 +112,14 @@ resume() {
 }
 
 configure() {
-  local node='' online_gib='' do_reboot=0 arg
+  local node='' online_gib='' kernelcore_override='' kernel='' do_reboot=0 arg
   while (($#)); do
     arg=$1
     case "$arg" in
       --node) node=${2:-}; shift 2 ;;
       --online-gib) online_gib=${2:-}; shift 2 ;;
+      --kernelcore-gib) kernelcore_override=${2:-}; shift 2 ;;
+      --kernel) kernel=${2:-}; shift 2 ;;
       --reboot) do_reboot=1; shift ;;
       --help|-h)
         sed -n '2,12p' "$0"
@@ -126,10 +131,15 @@ configure() {
 
   require_root
   [[ $node =~ ^[0-9]+$ ]] || die '--node must be a non-negative integer'
-  [[ $online_gib =~ ^[1-9][0-9]*$ ]] || die '--online-gib must be a positive whole number'
+  [[ -z $online_gib || $online_gib =~ ^[1-9][0-9]*$ ]] || die '--online-gib must be a positive whole number'
+  [[ -z $kernelcore_override || $kernelcore_override =~ ^[1-9][0-9]*$ ]] || die '--kernelcore-gib must be a positive whole number'
+  [[ -n $online_gib || -n $kernelcore_override ]] || die 'provide --online-gib or --kernelcore-gib'
+  [[ -z $online_gib || -z $kernelcore_override ]] || die 'use only one of --online-gib and --kernelcore-gib'
   [[ -d "/sys/devices/system/node/node$node" ]] || die "NUMA node $node is absent"
 
-  if has_current_kernelcore; then
+  [[ -n $kernel ]] || kernel=$(current_kernel_path)
+  [[ -f $kernel ]] || die "kernel image does not exist: $kernel"
+  if [[ $kernel == "$(current_kernel_path)" ]] && has_current_kernelcore; then
     note 'The running kernel already has a kernelcore= parameter. No changes made.'
     return 0
   fi
@@ -138,23 +148,33 @@ configure() {
   command -v systemctl >/dev/null || die 'systemd is required'
   [[ ! -e "$STATE_FILE" ]] || die "a pending operation exists at $STATE_FILE"
 
-  local kernel old_default nodes kernelcore_gib
-  kernel=$(current_kernel_path)
+  local old_default nodes kernelcore_gib target_release entry
   grubby --info "$kernel" >/dev/null || die "GRUB has no entry for $kernel"
+  entry=$(grubby --info "$kernel")
+  if [[ " $entry " =~ [[:space:]]kernelcore=[^[:space:]]+ ]]; then
+    note 'The selected kernel already has a kernelcore= parameter. No changes made.'
+    return 0
+  fi
   old_default=$(grubby --default-kernel)
-  nodes=$(memory_node_count)
-  ((nodes > 0)) || die 'could not find any memory-bearing NUMA nodes'
-  kernelcore_gib=$((online_gib * nodes))
-
-  note "Memory-bearing NUMA nodes: $nodes"
-  note "Requested node-$node normal-memory target: about ${online_gib} GiB"
+  target_release=$(basename "$kernel")
+  target_release=${target_release#vmlinuz-}
+  if [[ -n $online_gib ]]; then
+    nodes=$(memory_node_count)
+    ((nodes > 0)) || die 'could not find any memory-bearing NUMA nodes'
+    kernelcore_gib=$((online_gib * nodes))
+    note "Memory-bearing NUMA nodes: $nodes"
+    note "Requested node-$node normal-memory target: about ${online_gib} GiB"
+  else
+    kernelcore_gib=$kernelcore_override
+    note "Requested global kernelcore budget: ${kernelcore_gib} GiB"
+  fi
   note "Adding kernelcore=${kernelcore_gib}G to $kernel"
   note 'The final online size can be higher because mixed hotplug blocks cannot be split.'
 
   install -D -m 0755 "$(readlink -f "${BASH_SOURCE[0]}")" "$INSTALL_PATH"
   install -d -m 0700 "$STATE_DIR"
-  printf 'NODE=%q\nKERNELCORE=%q\nOLD_DEFAULT_KERNEL=%q\n' \
-    "$node" "${kernelcore_gib}G" "$old_default" > "$STATE_FILE"
+  printf 'NODE=%q\nKERNELCORE=%q\nTARGET_RELEASE=%q\nOLD_DEFAULT_KERNEL=%q\n' \
+    "$node" "${kernelcore_gib}G" "$target_release" "$old_default" > "$STATE_FILE"
   write_unit
 
   grubby --update-kernel="$kernel" --args="kernelcore=${kernelcore_gib}G"
